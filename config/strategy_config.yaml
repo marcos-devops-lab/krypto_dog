@@ -1,0 +1,28 @@
+# Strategy Configuration
+
+symbol: "BTCUSDT"
+timeframe: "1m"
+
+entry_conditions:
+  rsi:
+    period: 14
+    threshold: 70
+    condition: "below"  # Options: "below", "above"
+  macd:
+    fast_period: 12
+    slow_period: 26
+    signal_period: 9
+    crossover: "bullish"  # Options: "bullish", "bearish"
+  pullback:
+    percentage: 1.0  # Pullback before entry (in %)
+  price_move:
+    percentage: 2.0  # Required move after pullback to count as trade
+
+exit_conditions:
+  holding_period: 5  # in candles
+  stop_loss: 1.0     # in % below entry price
+  take_profit: 2.0   # in % above entry price
+
+capital:
+  initial: 10000
+  trade_size: 1000
