@@ -1,27 +1,28 @@
-# Strategy Configuration
-
 symbol: "BTCUSDT"
 timeframe: "1m"
+
+data:
+  path: "data/PEPE_1m.csv" # Ensure this path is correct for your setup
 
 entry_conditions:
   rsi:
     period: 14
-    threshold: 70
+    threshold: 90
     condition: "below"  # Options: "below", "above"
   macd:
     fast_period: 12
     slow_period: 26
     signal_period: 9
-    crossover: "bullish"  # Options: "bullish", "bearish"
+    crossover: "bullish"  # Options: "bullish", "bearish" (Note: 'bearish' currently won't generate long trades)
   pullback:
-    percentage: 1.0  # Pullback before entry (in %)
+    percentage: 0.1  # Pullback from current candle's high (in %)
   price_move:
-    percentage: 2.0  # Required move after pullback to count as trade
+    percentage: 2.0  # Required move AFTER entry. Not currently used for entry logic in strategy.py
 
 exit_conditions:
-  holding_period: 5  # in candles
-  stop_loss: 1.0     # in % below entry price
-  take_profit: 2.0   # in % above entry price
+  holding_period: 100  # in candles
+  stop_loss: 5.0     # in % below entry price
+  take_profit: 1.0   # in % above entry price
 
 capital:
   initial: 10000
