@@ -1,29 +1,129 @@
-symbol: "BTCUSDT"
-timeframe: "1m"
+# Master Configuration File for the Krypto-Dog AI Trading System
 
-data:
-  path: "data/PEPE_1m.csv" # Ensure this path is correct for your setup
+# --- 1. DATA FETCHING & MANAGEMENT ---
+data_fetching:
+  exchange: "binance"        # Exchange to fetch data from (e.g., "binance", "bybit")
+  symbol: "ADA/USDT"         # Trading pair for primary operations (e.g., "ADA/USDT", "BTC/USDT")
+  timeframe: "1m"            # Candlestick timeframe (e.g., "1m", "5m", "1h", "4h", "1d")
+  # Start date for historical data fetching. IMPORTANT: Use earliest available data for chosen symbol/timeframe.
+  # For ADA/USDT 1m on Binance, approx. 2017-09-01. Adjust if using other pairs/exchanges.
+  since: "2017-09-01 00:00:00"
+  limit_per_request: 1000    # Max candles per API call (Binance max is 1000 for 1m)
+  csv_file: "ADA_USDT_1m.csv" # Local file where fetched OHLCV data will be stored.
+  # data_quality_checks: # Future: Implement checks for missing data, outliers
+  #   min_volume_per_candle: 0.1
+  #   max_missing_candles_pct: 0.01
 
-entry_conditions:
-  rsi:
-    period: 14
-    threshold: 90
-    condition: "below"  # Options: "below", "above"
-  macd:
-    fast_period: 12
-    slow_period: 26
-    signal_period: 9
-    crossover: "bullish"  # Options: "bullish", "bearish" (Note: 'bearish' currently won't generate long trades)
-  pullback:
-    percentage: 0.1  # Pullback from current candle's high (in %)
-  price_move:
-    percentage: 2.0  # Required move AFTER entry. Not currently used for entry logic in strategy.py
+# --- 2. FEATURE ENGINEERING & PREPROCESSING ---
+feature_engineering:
+  # General settings for feature generation from raw OHLCV and indicators
+  technical_indicators:
+    # Periods for common indicators. Can be optimized by Optuna later.
+    rsi_period: 14
+    macd_fast_period: 12
+    macd_slow_period: 26
+    macd_signal_period: 9
+    bollinger_window: 20
+    bollinger_dev: 2
+    ema_short_period: 9
+    ema_medium_period: 20
+    ema_long_period: 50
+    ema_very_long_period: 200
+  lagged_features_lags: [1, 2, 3, 5, 10, 20] # Lags for historical data points
+  rolling_features_windows: [5, 10, 20, 50] # Windows for rolling statistics (mean, std)
+  # feature_selection_method: "SHAP" # Future: For automatic feature selection
+  # feature_transformation: "StandardScaler" # Currently hardcoded, but can be a choice
 
-exit_conditions:
-  holding_period: 100  # in candles
-  stop_loss: 5.0     # in % below entry price
-  take_profit: 1.0   # in % above entry price
+# --- 3. MODEL TRAINING (Supervised Learning - XGBoost/LightGBM/RF) ---
+model_training:
+  # Parameters for generating labels (the target variable for your ML model)
+  labeling:
+    look_forward_candles: 100 # How many future candles to look for a profit/stop loss outcome
+    # Profit/Stop Loss targets for *labeling* the data (used by feature_engineer.py).
+    # These typically align with the strategy's targets.
+    profit_target_pct: 1.0    # If price rises by this % within look_forward, it's a positive label (1)
+    stop_loss_pct: 5.0      # If price drops by this % within look_forward, it's a negative label (0)
+    # Future:
+    # risk_reward_ratio_for_labeling: 2.0 # Only label 1 if (profit_target / stop_loss) >= this ratio
+    # first_hit_wins_logic: true # More advanced labeling to determine first hit between profit/stoploss
 
-capital:
-  initial: 10000
-  trade_size: 1000
+  # Data splitting for ML model training/testing
+  train_test_split_ratio: 0.25 # Fraction of data to reserve for testing the ML model
+
+  # XGBoost Model Hyperparameters (These are the *defaults*. Optuna will override/optimize these)
+  xgboost_hyperparameters:
+    objective: "binary:logistic" # Binary classification for predicting win/loss
+    eval_metric: "logloss"
+    n_estimators: 500            # Number of boosting rounds (trees)
+    learning_rate: 0.05          # Step size shrinkage
+    max_depth: 5                 # Maximum depth of a tree
+    subsample: 0.7               # Subsample ratio of the training instance
+    colsample_bytree: 0.7        # Subsample ratio of columns when constructing each tree
+    gamma: 0.1                   # Minimum loss reduction
+    reg_lambda: 1                # L2 regularization (Lambda)
+    reg_alpha: 0                 # L1 regularization (Alpha)
+    tree_method: "hist"          # Faster algorithm for large datasets
+    # scale_pos_weight is calculated dynamically in model_trainer.py for class imbalance.
+    # Future:
+    # model_type: "XGBoost" # Option for LightGBM, RandomForest etc.
+    # cross_validation_folds: 5 # For internal CV during model training
+
+# --- 4. TRADING STRATEGY LOGIC & PARAMETERS ---
+strategy:
+  # Entry conditions: These define when the system *considers* a trade.
+  # The ML model's prediction will then be the *final filter*.
+  entry_filters:
+    # Based on the strategy logic in strategy.py
+    # These are initial/default values that Optuna will tune.
+    rsi_threshold: 30       # Example: RSI must be below 30 for a potential long entry
+    macd_crossover_type: "bullish" # "bullish" or "bearish" (for long trades, bullish)
+    pullback_percentage: 0.1 # Price must pull back by this % from its high for confirmation
+    # ml_confidence_threshold: 0.75 # Future: Only take trade if ML model predicts >75% win probability
+    # min_predicted_ror: 0.01 # Future: Minimum predicted Return on Risk from ML model
+
+  # Exit conditions: These define when a trade is closed.
+  exit_logic:
+    holding_period_candles: 100 # Max duration a trade can stay open (in candles)
+    # These are default values for *testing*, Optuna will tune them.
+    stop_loss_percentage: 5.0   # Percentage below entry price for stop loss
+    take_profit_percentage: 1.0 # Percentage above entry price for take profit
+    # Future:
+    # trailing_stop_loss_start_pct: 0.5 # When to activate trailing stop loss
+    # trailing_stop_loss_delta_pct: 0.1 # How tight the trailing stop is
+    # indicator_exit_signal: # Exit based on another indicator crossing
+
+# --- 5. OPTIMIZATION SETTINGS (For Optuna in ai/optimizer.py) ---
+optimization:
+  n_trials: 100              # Number of optimization trials Optuna will run
+  direction: "maximize"      # "maximize" for expectancy, "minimize" for drawdown (or multi-objective)
+  # objective_metric: "expectancy" # Primary metric for Optuna to optimize (e.g., "expectancy", "total_profit", "sharpe_ratio")
+  sampler: "TPESampler"      # Optuna sampler (e.g., "TPESampler", "RandomSampler", "CmaEsSampler")
+  pruner: "MedianPruner"     # Optuna pruner (e.g., "MedianPruner", "HyperbandPruner", "SuccessiveHalvingPruner")
+  # Future:
+  # walk_forward_validation:
+  #   enabled: true
+  #   train_window_candles: 50000 # E.g., 50,000 1m candles for training
+  #   test_window_candles: 10000  # E.g., 10,000 1m candles for testing (approx. 1 week)
+  #   step_forward_candles: 10000 # How many candles to advance the window each time
+  #   initial_offset_candles: 50000 # Offset from start for first train window
+
+# --- 6. CAPITAL & RISK MANAGEMENT ---
+capital_management:
+  initial_capital: 10000     # Starting capital for backtests and live trading
+  trade_size_percentage: 0.1 # Percentage of current capital to risk per trade (e.g., 0.1 = 10%)
+  # max_drawdown_percentage: 0.20 # Max percentage of capital loss before stopping system
+  # max_daily_loss_percentage: 0.05 # Max percentage of daily capital loss
+  # max_simultaneous_trades: 1 # Limit on open trades
+  # transaction_fees_pct: 0.00075 # Example: 0.075% fee for Binance (can vary for maker/taker/VIP)
+
+# --- 7. LIVE TRADING / PAPER TRADING (Future Phase) ---
+# live_trading:
+#   enabled: false
+#   mode: "paper" # "paper" or "live"
+#   api_keys_env_var: "BINANCE_API_KEY" # Name of environment variable holding API key
+#   api_secret_env_var: "BINANCE_API_SECRET" # Name of environment variable holding API secret
+#   log_level: "DEBUG"
+#   telegram_notifications:
+#     enabled: false
+#     chat_id_env_var: "TELEGRAM_CHAT_ID"
+#     bot_token_env_var: "TELEGRAM_BOT_TOKEN"

@@ -1,0 +1,10 @@
+pandas
+numpy
+scikit-learn
+xgboost
+pyyaml
+joblib
+ta          # <--- THIS IS THE CORRECT ONE NOW
+ccxt
+shap
+optuna

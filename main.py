@@ -51,7 +51,7 @@ def main():
     trades = apply_strategy(df, config, run_id, strategy_name, logger)
 
     if trades.empty:
-        print("⚠️ No trades found. Adjust strategy parameters or data range.")
+        print("No trades found. Adjust strategy parameters or data range.")
     else:
         total = len(trades)
         wins = len(trades[trades['outcome'] == 'win'])

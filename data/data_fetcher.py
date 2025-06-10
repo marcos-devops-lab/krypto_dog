@@ -1,111 +1,122 @@
-# data/data_fetcher.py
-
 import ccxt
 import pandas as pd
-from datetime import datetime, timedelta, timezone # Import timezone
 import time
 import os
+import yaml
+import logging
 
-def fetch_ohlcv(exchange_id, symbol, timeframe, since_date, limit=1000, output_filename=None):
-    """
-    Fetches OHLCV data from an exchange, handling pagination, and saves it to a CSV.
-    Fetches all available data from since_date up to the current time.
-    """
+# Set up logging for better feedback
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def get_config(config_path='config/strategy_config.yaml'):
+    """Loads configuration from a YAML file."""
     try:
-        exchange = getattr(ccxt, exchange_id)()
-        exchange.load_markets()
-    except AttributeError:
-        print(f"Error: Exchange '{exchange_id}' not found in ccxt.")
-        return
+        with open(config_path, 'r') as f:
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        logging.error(f"Config file not found at {config_path}. Please ensure it exists.")
+        return None
+    except yaml.YAMLError as e:
+        logging.error(f"Error parsing config file: {e}")
+        return None
 
-    # Convert since_date to milliseconds timestamp (UTC for consistency)
-    # Ensure since_date is parsed as UTC to avoid timezone issues
-    since_dt_utc = datetime.strptime(since_date, '%Y-%m-%d').replace(tzinfo=timezone.utc)
-    since_ms = exchange.parse8601(since_dt_utc.isoformat())
+def fetch_ohlcv(exchange_id, symbol, timeframe, since, limit=None):
+    """
+    Fetches OHLCV data from a specified exchange.
+    :param exchange_id: Exchange ID (e.g., 'binance')
+    :param symbol: Trading pair (e.g., 'ADA/USDT')
+    :param timeframe: Candlestick timeframe (e.g., '1m', '5m', '1h')
+    :param since: Timestamp in milliseconds from which to fetch data
+    :param limit: Number of candles to fetch per request (max 1000 for Binance)
+    :return: Pandas DataFrame with OHLCV data
+    """
+    exchange_class = getattr(ccxt, exchange_id)
+    exchange = exchange_class({
+        'enableRateLimit': True,  # Ensures adherence to exchange rate limits
+        'options': {
+            'defaultType': 'future', # Important for Binance Futures
+        },
+    })
 
     all_ohlcv = []
-    current_fetch_timestamp = since_ms
+    current_since = since
+    
+    logging.info(f"Starting data fetch for {symbol} on {exchange_id} ({timeframe}) from {pd.to_datetime(since, unit='ms')}...")
 
-    print(f"Fetching {symbol} {timeframe} data from {since_date} onwards...")
-    print(f"Starting fetch from {datetime.fromtimestamp(current_fetch_timestamp / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
-
-    # Define a target end time, e.g., now minus a small buffer (e.g., 5 minutes)
-    # to avoid fetching incomplete current candles
-    end_ms = exchange.milliseconds() - exchange.parse_timeframe(timeframe) * 1000 * 5 
-
-    while current_fetch_timestamp < end_ms:
+    while True:
         try:
-            # Fetch data with the maximum limit per request
-            ohlcv_chunk = exchange.fetch_ohlcv(symbol, timeframe, current_fetch_timestamp, limit)
+            # Fetch 'limit' candles from 'current_since'
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, current_since, limit)
             
-            if not ohlcv_chunk:
-                print("No more data to fetch for this period.")
-                break # No more data means we've reached the end
+            if not ohlcv:
+                logging.info("No more data found. Stopping fetch.")
+                break
 
-            all_ohlcv.extend(ohlcv_chunk)
+            all_ohlcv.extend(ohlcv)
             
-            # Move the timestamp forward for the next fetch
-            # The next fetch should start from the timestamp AFTER the last fetched candle
-            current_fetch_timestamp = ohlcv_chunk[-1][0] + exchange.parse_timeframe(timeframe) * 1000
+            # Update current_since to the timestamp of the last fetched candle + 1 minute (or timeframe)
+            # This handles potential overlaps or gaps correctly.
+            last_timestamp = ohlcv[-1][0]
+            current_since = last_timestamp + exchange.parse_timeframe(timeframe) * 1000 # Convert timeframe to milliseconds
+
+            logging.info(f"Fetched {len(ohlcv)} candles up to {pd.to_datetime(last_timestamp, unit='ms')}. Total fetched: {len(all_ohlcv)}")
+
+            # Binance typically limits to 1000 candles per request for 1m timeframe.
+            # If we don't get 'limit' candles, it means we've reached the end of available data.
+            if len(ohlcv) < limit:
+                logging.info(f"Less than {limit} candles fetched, indicating end of available data or current time.")
+                break
             
-            # For progress indication
-            last_fetched_candle_dt = datetime.fromtimestamp(ohlcv_chunk[-1][0] / 1000, tz=timezone.utc)
-            print(f"Fetched up to: {last_fetched_candle_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            # Simple rate limiting for very fast loops
+            time.sleep(exchange.rateLimit / 1000)
 
-            # Implement rate limiting to avoid getting banned or errors
-            # Binance's default rate limit is often around 1200 requests/minute (for weight 1 endpoints)
-            # A sleep based on exchange.rateLimit is generally safe, but a bit slow.
-            # For high volume fetching, you might need to adjust or use async methods.
-            time.sleep(exchange.rateLimit / 1000 + 0.1) # Add a small buffer
-
-        except ccxt.RateLimitExceeded as e:
-            print(f"Rate limit exceeded: {e}. Sleeping for 10 seconds...")
-            time.sleep(10)
-            continue
-        except ccxt.NetworkError as e:
-            print(f"Network error: {e}. Retrying in 5 seconds...")
-            time.sleep(5)
-            continue
+        except ccxt.RateLimitExceeded:
+            logging.warning("Rate limit exceeded. Waiting longer before retrying.")
+            time.sleep(exchange.rateLimit / 1000 + 5) # Wait rateLimit + 5 seconds
         except ccxt.ExchangeError as e:
-            print(f"Exchange error: {e}. Check symbol, timeframe, or API limits. Breaking.")
+            logging.error(f"Exchange error: {e}")
             break
         except Exception as e:
-            print(f"An unexpected error occurred: {e}. Breaking.")
+            logging.error(f"An unexpected error occurred during fetching: {e}")
             break
-    
-    if not all_ohlcv:
-        print("No data fetched. Please check parameters or try a different date range.")
-        return
 
-    # Convert to DataFrame
     df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True) # Ensure UTC conversion
-    
-    # Sort by timestamp and drop duplicates (in case of overlap due to exchange API behavior)
-    df = df.sort_values('timestamp').drop_duplicates(subset=['timestamp']).reset_index(drop=True)
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df = df.set_index('timestamp')
+    df = df.sort_index() # Ensure chronological order
 
-    if output_filename:
-        output_path = os.path.join("data", output_filename) # Use os.path.join for cross-platform paths
-        df.to_csv(output_path, index=False)
-        print(f"\nSuccessfully fetched {len(df)} unique candles and saved to {output_path}")
-    else:
-        print(f"\nSuccessfully fetched {len(df)} unique candles (not saved).")
-    
+    logging.info(f"Finished fetching data. Total candles: {df.shape[0]}")
     return df
 
-if __name__ == "__main__":
-    # --- Configuration for 1000PEPE ---
-    exchange_id = 'binance'
-    symbol = 'PEPE/USDT' # Make sure this is the correct symbol on Binance
-    timeframe = '1m'     # 1-minute candles
-    
-    # **IMPORTANT**: Set this to the approximate listing date of PEPE on Binance.
-    # A quick check shows PEPE was listed around May 2023. Let's use an early date.
-    since_date = '2023-05-01' # YYYY-MM-DD - This will attempt to fetch ALL 1m data from this date.
-    
-    output_file = 'PEPE_1m.csv' # This will overwrite the existing file with more data
-    
-    # Fetch data
-    fetch_ohlcv(exchange_id, symbol, timeframe, since_date, output_filename=output_file)
+def main():
+    config = get_config()
+    if config is None:
+        return
 
-    print("\nData fetching process complete. The generated CSV should be significantly larger.")
+    data_config = config.get('data_fetching', {})
+    
+    symbol = data_config.get('symbol', 'ADA/USDT') # Default to ADA/USDT
+    timeframe = data_config.get('timeframe', '1m') # Default to 1m
+    since_str = data_config.get('since', '2017-09-01 00:00:00') # Default to ADA's earliest data on Binance
+    limit_per_request = data_config.get('limit_per_request', 1000) # Max per request for Binance
+    output_dir = 'data'
+    output_filename = data_config.get('csv_file', f"{symbol.replace('/', '_')}_{timeframe}.csv") # Default filename
+    output_path = os.path.join(output_dir, output_filename)
+
+    # Convert 'since' string to milliseconds timestamp
+    since_ms = int(pd.Timestamp(since_str).timestamp() * 1000)
+
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+
+    logging.info(f"Fetching data for {symbol} ({timeframe}) from {since_str}...")
+    df_ohlcv = fetch_ohlcv('binance', symbol, timeframe, since_ms, limit_per_request)
+
+    if df_ohlcv is not None and not df_ohlcv.empty:
+        df_ohlcv.to_csv(output_path, index=True)
+        logging.info(f"Successfully saved {df_ohlcv.shape[0]} candles to {output_path}")
+    else:
+        logging.warning("No data fetched or DataFrame is empty. CSV file not created.")
+
+if __name__ == "__main__":
+    main()

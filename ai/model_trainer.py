@@ -1,134 +1,226 @@
-# ai/model_trainer.py
-
-import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
-import xgboost as xgb
-import joblib # For saving/loading models
-import shap # For explainability
+import sys
 import os
 
-# Assume data_loader and feature_engineer are in correct relative paths
-from utils.data_loader import load_ohlcv
-from ai.feature_engineer import generate_features
+# Add the project root to the Python path
+# This assumes model_trainer.py is in krypto_dog/ai/
+# And ml/feature_engineer.py is in krypto_dog/ml/
+# The project root is krypto_dog/
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
-def generate_labels(df: pd.DataFrame, look_forward_candles: int = 5, profit_target_pct: float = 1.0, stop_loss_pct: float = 1.0) -> pd.Series:
-    """
-    Generates binary labels based on future price movement.
-    1 if price moves up by profit_target_pct within look_forward_candles,
-    0 if price moves down by stop_loss_pct within look_forward_candles,
-    NaN otherwise (neutral/no clear signal).
-    """
-    labels = pd.Series(index=df.index, dtype=float)
+# The rest of your imports start here
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
+import joblib
+import yaml
+import logging
+# ... (rest of your existing imports) ...
 
-    for i in range(len(df) - look_forward_candles):
-        current_close = df['close'].iloc[i]
-        future_period = df['close'].iloc[i+1 : i + look_forward_candles + 1]
+# Import the feature engineering module (this line stays the same)
+from ml.feature_engineer import load_data, add_technical_indicators, add_lagged_features, \
+                                add_rolling_features, generate_labels, preprocess_features
 
-        # Calculate max gain and max loss in the future period
-        max_future_gain = (future_period.max() - current_close) / current_close * 100
-        min_future_loss = (future_period.min() - current_close) / current_close * 100
+# ... (rest of your model_trainer.py code) ...
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
+import joblib
+import yaml
+import logging
+import os
 
-        # Labeling logic
-        if max_future_gain >= profit_target_pct:
-            labels.iloc[i] = 1 # Profitable move expected
-        elif min_future_loss <= -stop_loss_pct:
-            labels.iloc[i] = 0 # Losing move expected (or adverse movement)
-        # Else, leave as NaN (neutral outcomes to be dropped or handled differently)
-    
-    return labels
+# Import the feature engineering module
+# Ensure ml/feature_engineer.py is in the correct path relative to this script's execution
+try:
+    from ml.feature_engineer import load_data, add_technical_indicators, add_lagged_features, \
+                                    add_rolling_features, generate_labels, preprocess_features
+except ImportError as e:
+    logging.error(f"Failed to import feature_engineer module: {e}. "
+                  "Ensure ml/feature_engineer.py exists and is accessible.")
+    raise
 
-def train_model(config_path="config/strategy_config.yaml", save_model=True):
-    # Load data path from config
-    import yaml
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    data_path = config['data']['path']
-    profit_target = config['exit_conditions']['take_profit'] # Use existing config values
-    stop_loss = config['exit_conditions']['stop_loss']
-    look_forward = config['exit_conditions']['holding_period'] # Use holding period as look forward window
+# Set up logging for better feedback
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    print(f"Loading data from {data_path}...")
-    df_ohlcv = load_ohlcv(data_path)
-    
-    print("Generating features...")
-    df_features = generate_features(df_ohlcv)
-
-    print(f"Generating labels (look_forward={look_forward}, profit_target={profit_target}%, stop_loss={stop_loss}%)...")
-    # Align labels to features DataFrame index
-    labels = generate_labels(df_ohlcv, look_forward_candles=look_forward, 
-                             profit_target_pct=profit_target, stop_loss_pct=stop_loss)
-    
-    # Merge features and labels, then drop rows with NaN labels
-    combined_df = pd.concat([df_features, labels.rename('target')], axis=1).dropna()
-    
-    if combined_df.empty:
-        print("Error: No data available after feature and label generation/dropna. Check data, indicators, and labeling parameters.")
-        return
-
-    X = combined_df.drop('target', axis=1)
-    y = combined_df['target']
-
-    # --- Data Splitting ---
-    # Use a time-series split to avoid look-ahead bias.
-    # Simple split: take first 80% for training, last 20% for testing.
-    train_size = int(len(X) * 0.8)
-    X_train, X_test = X.iloc[:train_size], X.iloc[train_size:]
-    y_train, y_test = y.iloc[:train_size], y.iloc[train_size:]
-
-    print(f"Train samples: {len(X_train)}, Test samples: {len(X_test)}")
-    print(f"Train label distribution:\n{y_train.value_counts(normalize=True)}")
-    print(f"Test label distribution:\n{y_test.value_counts(normalize=True)}")
-
-    if X_train.empty or X_test.empty or y_train.empty or y_test.empty:
-        print("Not enough data for training/testing after splitting. Ensure you have sufficient historical data.")
-        return
-
-    # --- Model Training (XGBoost for this example) ---
-    print("\nTraining XGBoost Classifier...")
-    model = xgb.XGBClassifier(objective='binary:logistic', eval_metric='logloss', use_label_encoder=False, random_state=42)
-    model.fit(X_train, y_train)
-    print("Model training complete.")
-
-    # --- Model Evaluation ---
-    print("\nEvaluating model on test set...")
-    y_pred = model.predict(X_test)
-    y_proba = model.predict_proba(X_test)[:, 1] # Probability of positive class
-
-    print("\nClassification Report:")
-    print(classification_report(y_test, y_pred))
-    print(f"ROC AUC Score: {roc_auc_score(y_test, y_proba):.4f}")
-    print("\nConfusion Matrix:")
-    print(confusion_matrix(y_test, y_pred))
-
-    # --- Feature Importance (via SHAP) ---
-    print("\nCalculating SHAP values for feature importance...")
+def get_config(config_path='config/strategy_config.yaml'):
+    """Loads configuration from a YAML file."""
     try:
+        with open(config_path, 'r') as f:
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        logging.error(f"Config file not found at {config_path}. Please ensure it exists.")
+        return None
+    except yaml.YAMLError as e:
+        logging.error(f"Error parsing config file: {e}")
+        return None
+
+def train_model(config_path='config/strategy_config.yaml', model_params=None):
+    """
+    Orchestrates the data loading, feature engineering, labeling,
+    XGBoost model training, evaluation, and saving.
+
+    :param config_path: Path to the main configuration YAML file.
+    :param model_params: Dictionary of XGBoost hyperparameters to use.
+                         If None, default params from config will be used.
+    """
+    logging.info("Starting model training process...")
+
+    config = get_config(config_path)
+    if config is None:
+        logging.error("Configuration could not be loaded. Aborting training.")
+        return
+
+    data_config = config.get('data_fetching', {})
+    model_config = config.get('model_training', {})
+    
+    data_file_path = os.path.join('data', data_config.get('csv_file', 'PEPE_1m.csv')) # Use os.path.join for robustness
+
+    # 1. Load Data
+    df_ohlcv = load_data(data_file_path)
+    if df_ohlcv is None or df_ohlcv.empty:
+        logging.error("Failed to load OHLCV data. Aborting training.")
+        return
+
+    # 2. Feature Engineering
+    logging.info("Generating features...")
+    df_features = add_technical_indicators(df_ohlcv.copy())
+    df_features = add_lagged_features(df_features)
+    df_features = add_rolling_features(df_features)
+
+    # Access labeling parameters correctly from the nested config structure
+    logging.info(f"Generating labels (look_forward_candles={model_config['labeling']['look_forward_candles']}, "
+                 f"profit_target_pct={model_config['labeling']['profit_target_pct']}%, "
+                 f"stop_loss_pct={model_config['labeling']['stop_loss_pct']}%)...")
+    
+    # This line stays as is, as generate_labels expects the model_config dictionary
+    df_labeled = generate_labels(df_features, model_config)
+
+    # 4. Preprocess Features and Labels
+    # Separate features (X) and target (y)
+    # Ensure 'label' is the target. Drop other columns that are not features (like raw OHLCV if desired).
+    # The preprocess_features function will handle NaNs and scaling, returning the feature matrix and scaler
+    df_processed, scaler = preprocess_features(df_labeled.copy())
+
+    # Ensure 'label' column exists and is numeric after preprocessing
+    if 'label' not in df_processed.columns:
+        logging.error("Label column 'label' not found after preprocessing. Aborting training.")
+        return
+    
+    # Extract features (X) and target (y)
+    # Exclude non-feature columns including the raw OHLCV if they were concat'd back
+    # IMPORTANT: The feature_columns list from preprocess_features should be used here to ensure consistency
+    # Let's adjust preprocess_features to return feature_columns directly for clarity.
+    # For now, we'll re-derive them, assuming 'label' and 'OHLCV' are not features.
+    feature_columns = [col for col in df_processed.columns if col not in ['label', 'open', 'high', 'low', 'close', 'volume']]
+    
+    X = df_processed[feature_columns]
+    y = df_processed['label']
+
+    if X.empty or y.empty:
+        logging.warning("No data or labels remaining after preprocessing. Model training skipped.")
+        return
+
+    # 5. Split Data (Train/Test)
+    test_size = model_config.get('test_size', 0.25)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, stratify=y, random_state=42)
+    logging.info(f"Train samples: {X_train.shape[0]}, Test samples: {X_test.shape[0]}")
+    logging.info("Train label distribution:\n" + y_train.value_counts(normalize=True).to_string())
+    logging.info("Test label distribution:\n" + y_test.value_counts(normalize=True).to_string())
+
+    # 6. Define XGBoost Model Parameters
+    # Default parameters - these can be overridden by 'model_params' from Optuna
+    xgb_default_params = {
+        'objective': 'binary:logistic', # For binary classification
+        'eval_metric': 'logloss',       # Evaluation metric during training
+        'use_label_encoder': False,     # Suppress warning for newer XGBoost versions
+        'n_estimators': 500,            # Number of boosting rounds
+        'learning_rate': 0.05,          # Step size shrinkage
+        'max_depth': 5,                 # Maximum depth of a tree
+        'subsample': 0.7,               # Subsample ratio of the training instance
+        'colsample_bytree': 0.7,        # Subsample ratio of columns when constructing each tree
+        'gamma': 0.1,                   # Minimum loss reduction required to make a further partition
+        'lambda': 1,                    # L2 regularization term on weights
+        'alpha': 0,                     # L1 regularization term on weights
+        'random_state': 42,
+        'tree_method': 'hist',          # For faster training on larger datasets
+        # Crucial for imbalanced datasets: balance positive and negative weights.
+        # It's (count_negative_instances / count_positive_instances)
+        'scale_pos_weight': (y_train.value_counts()[0] / y_train.value_counts()[1]) if y_train.value_counts()[1] != 0 else 1
+    }
+
+    # Override defaults with any parameters provided by Optuna
+    if model_params:
+        xgb_default_params.update(model_params)
+        logging.info("XGBoost model parameters overridden by Optuna suggestions.")
+    else:
+        logging.info("Using default XGBoost model parameters.")
+
+    # 7. Train XGBoost Classifier
+    logging.info("Training XGBoost Classifier...")
+    model = xgb.XGBClassifier(**xgb_default_params)
+    model.fit(X_train, y_train)
+    logging.info("Model training complete.")
+
+    # 8. Evaluate Model
+    logging.info("Evaluating model on test set...")
+    y_pred = model.predict(X_test)
+    y_pred_proba = model.predict_proba(X_test)[:, 1] # Probability of the positive class
+
+    logging.info("\nClassification Report:\n" + classification_report(y_test, y_pred))
+    logging.info(f"ROC AUC Score: {roc_auc_score(y_test, y_pred_proba):.4f}")
+    logging.info("Confusion Matrix:\n" + str(confusion_matrix(y_test, y_pred)))
+
+    # 9. Feature Importance (using SHAP - requires shap to be installed and working)
+    try:
+        import shap
+        logging.info("Calculating SHAP values for feature importance...")
         explainer = shap.TreeExplainer(model)
         shap_values = explainer.shap_values(X_test)
-        # shap.summary_plot(shap_values, X_test, plot_type="bar", show=False) # Requires matplotlib for plotting
-        # For simplicity, just print top features by mean absolute SHAP value
-        if isinstance(shap_values, list): # For multi-output models, often returns list
-            shap_values = shap_values[1] # Take SHAP values for the positive class (label 1)
-        
-        shap_sum = np.abs(shap_values).mean(axis=0)
-        importance_df = pd.DataFrame({'feature': X_test.columns, 'importance': shap_sum})
-        importance_df = importance_df.sort_values(by='importance', ascending=False)
-        print("\nTop 10 Feature Importance (Mean Absolute SHAP Value):")
-        print(importance_df.head(10))
+
+        # Ensure shap_values is an array, not a list of arrays (for binary classification, it's a list)
+        if isinstance(shap_values, list) and len(shap_values) > 1:
+            # For binary classification, shap_values[1] typically corresponds to the positive class
+            shap_values = shap_values[1]
+
+        # Calculate mean absolute SHAP value for each feature
+        feature_importance = pd.DataFrame({
+            'feature': X_test.columns,
+            'importance': np.abs(shap_values).mean(axis=0)
+        }).sort_values(by='importance', ascending=False)
+        logging.info("\nTop 10 Feature Importance (Mean Absolute SHAP Value):\n" + feature_importance.head(10).to_string())
+    except ImportError:
+        logging.warning("SHAP library not installed. Skipping SHAP feature importance calculation.")
     except Exception as e:
-        print(f"Could not calculate SHAP values: {e}. Ensure all dependencies are met (e.g., matplotlib for plotting).")
+        logging.warning(f"Error calculating SHAP values: {e}. Skipping SHAP feature importance.")
 
-    # --- Save Model ---
-    if save_model:
-        model_path = "ai/trained_model.pkl"
-        joblib.dump(model, model_path)
-        print(f"\nTrained model saved to {model_path}")
+    # 10. Save Model and Scaler
+    model_output_dir = 'ai'
+    os.makedirs(model_output_dir, exist_ok=True)
+    model_save_path = os.path.join(model_output_dir, 'trained_model.pkl')
+    scaler_save_path = os.path.join(model_output_dir, 'scaler.pkl') # Save scaler for live prediction
 
-    return model, X_test, y_test, y_pred, y_proba
+    joblib.dump(model, model_save_path)
+    joblib.dump(scaler, scaler_save_path) # Save the scaler used for preprocessing
+    logging.info(f"Trained model saved to {model_save_path}")
+    logging.info(f"Feature scaler saved to {scaler_save_path}")
+
+    # Return performance metrics for Optuna
+    return {
+        'roc_auc': roc_auc_score(y_test, y_pred_proba),
+        'precision_0': 0 if '0' not in classification_report(y_test, y_pred, output_dict=True)['0'] else classification_report(y_test, y_pred, output_dict=True)['0']['precision'],
+        'recall_0': 0 if '0' not in classification_report(y_test, y_pred, output_dict=True)['0'] else classification_report(y_test, y_pred, output_dict=True)['0']['recall'],
+        'f1_0': 0 if '0' not in classification_report(y_test, y_pred, output_dict=True)['0'] else classification_report(y_test, y_pred, output_dict=True)['0']['f1-score'],
+        'total_samples': X_test.shape[0]
+    }
+
 
 if __name__ == "__main__":
+    # This block runs when model_trainer.py is executed directly for testing
+    # It will use the default config/strategy_config.yaml
     train_model()
